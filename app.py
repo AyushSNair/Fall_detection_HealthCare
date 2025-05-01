@@ -9,12 +9,17 @@ from twilio.rest import Client
 from dotenv import load_dotenv
 from drive_upload import upload_to_drive
 import tempfile
+import mediapipe as mp
+import math
+
 
 # Load environment variables
 load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__, static_folder='static')
+
+
 
 # Load the trained YOLOv8-OBB model
 model = YOLO("best.pt")  # Replace with your model path
@@ -69,11 +74,51 @@ def inference_thread():
         frame_queue.task_done()
 
 # ⚠️ YOLOv8-OBB fall detection
+# Initialize MediaPipe pose once
+mp_pose = mp.solutions.pose
+pose = mp_pose.Pose()
+
+def calculate_angle(p1, p2):
+    dx = p2.x - p1.x
+    dy = p2.y - p1.y
+    radians = math.atan2(dy, dx)
+    angle = abs(math.degrees(radians))
+    return angle
+
 def detect_fall(frame):
     try:
         results = model.predict(source=frame, task='obb', verbose=False)
-        fall_detected = False
+        unnatural_posture = False
 
+        # MediaPipe Pose Estimation
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pose_results = pose.process(rgb_frame)
+
+        if pose_results.pose_landmarks:
+            lm = pose_results.pose_landmarks.landmark
+
+            left_shoulder = lm[mp_pose.PoseLandmark.LEFT_SHOULDER]
+            right_shoulder = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+            left_hip = lm[mp_pose.PoseLandmark.LEFT_HIP]
+            right_hip = lm[mp_pose.PoseLandmark.RIGHT_HIP]
+
+            mid_shoulder = type(left_shoulder)(x=(left_shoulder.x + right_shoulder.x) / 2,
+                                               y=(left_shoulder.y + right_shoulder.y) / 2,
+                                               z=0, visibility=1.0)
+
+            mid_hip = type(left_hip)(x=(left_hip.x + right_hip.x) / 2,
+                                     y=(left_hip.y + right_hip.y) / 2,
+                                     z=0, visibility=1.0)
+
+            vertical_distance = abs(mid_shoulder.y - mid_hip.y)
+            spine_angle = calculate_angle(mid_shoulder, mid_hip)
+
+            if vertical_distance < 0.1 and (spine_angle < 45 or spine_angle > 135):
+                unnatural_posture = True
+
+        final_fall = False
+
+        # YOLOv8 OBB-based fall detection
         for result in results:
             if result.obb is not None:
                 obbs = result.obb
@@ -85,40 +130,39 @@ def detect_fall(frame):
 
                     poly_points = obbs.xyxyxyxy[i].cpu().numpy().reshape(-1, 2).astype(int)
                     aabb = obbs.xyxy[i].cpu().numpy().astype(int)
-
-                    # Default label and color
-                    label = "non-fall"
-                    color = (0, 255, 0)  # Green
-
-                    if class_name in ["fall", "bending"] and confidence >= 0.7:
-                        label = class_name
-                        color = (0, 0, 255)  # Red
-                        if class_name == "fall":
-                            fall_detected = True
-
-                    # Draw OBB
-                    cv2.polylines(frame, [poly_points], isClosed=True, color=color, thickness=2)
-
-                    # Draw AABB
                     x1, y1, x2, y2 = aabb
+
+                    # Default values
+                    label = "Non-fall"
+                    color = (0, 255, 0)
+
+                    # Check if class is fall
+                    if class_name == "fall" and confidence >= 0.7:
+                        if unnatural_posture:
+                            label = "Fall"
+                            color = (0, 0, 255)
+                            final_fall = True
+                        else:
+                            label = "False Alarm"
+                            color = (0, 255, 255)
+
+                    # Draw everything
+                    cv2.polylines(frame, [poly_points], isClosed=True, color=color, thickness=2)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame, f"{label} ({confidence:.2f})", (x1, y1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-                    # Put label
-                    cv2.putText(
-                        frame,
-                        f"{label} ({confidence:.2f})",
-                        (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        color,
-                        2
-                    )
+        # Optional display
+        if unnatural_posture:
+            cv2.putText(frame, "⚠️ Unnatural posture detected", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-        return fall_detected, frame
+        return final_fall, frame
 
     except Exception as e:
         print("Error in detect_fall:", e)
         return False, frame
+
 
 
 # Record fall video
