@@ -19,7 +19,8 @@ load_dotenv()
 # Initialize Flask app
 app = Flask(__name__, static_folder='static')
 
-
+mp_drawing = mp.solutions.drawing_utils
+mp_pose = mp.solutions.pose
 
 # Load the trained YOLOv8-OBB model
 model = YOLO("best.pt")  # Replace with your model path
@@ -88,7 +89,9 @@ def calculate_angle(p1, p2):
 def detect_fall(frame):
     try:
         results = model.predict(source=frame, task='obb', verbose=False)
-        unnatural_posture = False
+        fall_detected_by_yolo = False
+        fall_detected_by_pose = False
+        final_fall = False
 
         # MediaPipe Pose Estimation
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -96,12 +99,21 @@ def detect_fall(frame):
 
         if pose_results.pose_landmarks:
             lm = pose_results.pose_landmarks.landmark
+            mp_drawing.draw_landmarks(
+                frame,
+                pose_results.pose_landmarks,
+                mp_pose.POSE_CONNECTIONS,
+                landmark_drawing_spec=mp_drawing.DrawingSpec(color=(0, 255, 255), thickness=2, circle_radius=3),
+                connection_drawing_spec=mp_drawing.DrawingSpec(color=(0, 128, 255), thickness=2)
+            )
 
+            # Get important keypoints
             left_shoulder = lm[mp_pose.PoseLandmark.LEFT_SHOULDER]
             right_shoulder = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER]
             left_hip = lm[mp_pose.PoseLandmark.LEFT_HIP]
             right_hip = lm[mp_pose.PoseLandmark.RIGHT_HIP]
 
+            # Midpoints
             mid_shoulder = type(left_shoulder)(x=(left_shoulder.x + right_shoulder.x) / 2,
                                                y=(left_shoulder.y + right_shoulder.y) / 2,
                                                z=0, visibility=1.0)
@@ -113,10 +125,9 @@ def detect_fall(frame):
             vertical_distance = abs(mid_shoulder.y - mid_hip.y)
             spine_angle = calculate_angle(mid_shoulder, mid_hip)
 
-            if vertical_distance < 0.1 and (spine_angle < 45 or spine_angle > 135):
-                unnatural_posture = True
-
-        final_fall = False
+            # Pose-based fall logic
+            if spine_angle < 40 or spine_angle > 160:
+                fall_detected_by_pose = True
 
         # YOLOv8 OBB-based fall detection
         for result in results:
@@ -136,25 +147,26 @@ def detect_fall(frame):
                     label = "Non-fall"
                     color = (0, 255, 0)
 
-                    # Check if class is fall
                     if class_name == "fall" and confidence >= 0.7:
-                        if unnatural_posture:
+                        if fall_detected_by_pose:
                             label = "Fall"
                             color = (0, 0, 255)
                             final_fall = True
                         else:
                             label = "False Alarm"
                             color = (0, 255, 255)
+                        fall_detected_by_yolo = True
 
-                    # Draw everything
+                    # Draw OBB + bounding box + label
                     cv2.polylines(frame, [poly_points], isClosed=True, color=color, thickness=2)
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                     cv2.putText(frame, f"{label} ({confidence:.2f})", (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        # Optional display
-        if unnatural_posture:
-            cv2.putText(frame, "⚠️ Unnatural posture detected", (10, 30),
+        # Case: Pose detects fall but YOLO doesn't
+        if fall_detected_by_pose and not fall_detected_by_yolo:
+            final_fall = True
+            cv2.putText(frame, "⚠️ Fall detected by posture", (10, 30),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
         return final_fall, frame
@@ -162,7 +174,6 @@ def detect_fall(frame):
     except Exception as e:
         print("Error in detect_fall:", e)
         return False, frame
-
 
 
 # Record fall video
