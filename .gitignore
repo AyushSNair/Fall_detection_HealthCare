@@ -1,0 +1,7 @@
+node_modules/
+myenv/
+venv/
+.env
+credentials.json
+rugged-memory-429113-t2-a664960c471c.json
+client_secret_73791551633-opkdpc80lkme644p4rbndd7us122adc4.apps.googleusercontent.com.json

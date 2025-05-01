@@ -1,0 +1,10 @@
+inference-sdk
+ultralytics
+opencv-python
+flask
+twilio
+python-dotenv
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client        
