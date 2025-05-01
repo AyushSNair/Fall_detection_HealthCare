@@ -1,5 +1,11 @@
-from ultralytics import YOLO
 import cv2
+import mediapipe as mp
+import numpy as np
+from ultralytics import YOLO
+import tensorflow as tf
+from sklearn.preprocessing import LabelEncoder
+from drive_upload import upload_to_drive
+import math
 import time
 import threading
 import queue
@@ -7,11 +13,7 @@ import os
 from flask import Flask, Response, jsonify
 from twilio.rest import Client
 from dotenv import load_dotenv
-from drive_upload import upload_to_drive
 import tempfile
-import mediapipe as mp
-import math
-
 
 # Load environment variables
 load_dotenv()
@@ -19,11 +21,25 @@ load_dotenv()
 # Initialize Flask app
 app = Flask(__name__, static_folder='static')
 
-mp_drawing = mp.solutions.drawing_utils
-mp_pose = mp.solutions.pose
-
 # Load the trained YOLOv8-OBB model
-model = YOLO("best.pt")  # Replace with your model path
+yolo_model = YOLO("best.pt")  # Update with your YOLOv8-OBB model path
+
+# Load the Keras model
+keras_model_path = "fall_detection_model.h5"  # Update with your Keras model path
+if not os.path.exists(keras_model_path):
+    print(f"Error: Keras model file {keras_model_path} not found")
+    exit()
+keras_model = tf.keras.models.load_model(keras_model_path)
+print("Keras model loaded successfully")
+
+# Define Keras label encoder (same as training: fall, non_fall, bending)
+keras_label_encoder = LabelEncoder()
+keras_label_encoder.fit(["fall", "non_fall", "bending"])
+
+# Initialize MediaPipe Pose
+mp_pose = mp.solutions.pose
+mp_drawing = mp.solutions.drawing_utils
+pose = mp_pose.Pose(static_image_mode=False, min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
 # Twilio config
 TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
@@ -38,9 +54,13 @@ twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 # Video setup
 cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    print("Error: Could not open webcam")
+    exit()
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
+# Global variables
 fall_detected_global = False
 last_notification_time = 0
 NOTIFICATION_COOLDOWN = 60
@@ -51,34 +71,10 @@ RECORD_DURATION = 7
 FPS = 30
 last_fall_time = 0
 FALL_DEBOUNCE_TIME = 2
-cooldown_time = 10  # seconds to wait before detecting another fall
-last_detection_time = 0
-is_recording = False
-record_start_time = 0
+buffer_size = 60
 frames_buffer = []
-buffer_size = 60  # Store 60 frames (~2 sec) before fall
 
-# Thread for real-time inference
-def inference_thread():
-    global fall_detected_global, last_fall_time
-    while True:
-        frame = frame_queue.get()
-        fall_detected, _ = detect_fall(frame)
-        current_time = time.time()
-
-        if fall_detected and (current_time - last_fall_time > FALL_DEBOUNCE_TIME):
-            fall_detected_global = True
-            last_fall_time = current_time
-            threading.Thread(target=record_and_send_notification, daemon=True).start()
-        else:
-            fall_detected_global = False
-        frame_queue.task_done()
-
-# ⚠️ YOLOv8-OBB fall detection
-# Initialize MediaPipe pose once
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose()
-
+# Function to calculate angle between two points
 def calculate_angle(p1, p2):
     dx = p2.x - p1.x
     dy = p2.y - p1.y
@@ -86,54 +82,35 @@ def calculate_angle(p1, p2):
     angle = abs(math.degrees(radians))
     return angle
 
+# Function to extract keypoints for Keras model
+def extract_keypoints_for_keras(image):
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    results = pose.process(image_rgb)
+    if results.pose_landmarks:
+        keypoints = []
+        for lm in results.pose_landmarks.landmark:
+            keypoints.extend([lm.x, lm.y])
+        return np.array(keypoints)
+    return None
+
+# Fall detection with YOLOv8, MediaPipe, and Keras
 def detect_fall(frame):
     try:
-        results = model.predict(source=frame, task='obb', verbose=False)
-        fall_detected_by_yolo = False
-        fall_detected_by_pose = False
+        # Step 1: YOLOv8-OBB detection
+        results = yolo_model.predict(source=frame, task='obb', verbose=False)
+        yolo_fall_detected = False
+        processed_frame = frame.copy()
+
+        # Initialize variables
         final_fall = False
+        unnatural_posture = False
+        keras_pred_class = "N/A"
+        keras_confidence = 0.0
 
-        # MediaPipe Pose Estimation
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pose_results = pose.process(rgb_frame)
-
-        if pose_results.pose_landmarks:
-            lm = pose_results.pose_landmarks.landmark
-            mp_drawing.draw_landmarks(
-                frame,
-                pose_results.pose_landmarks,
-                mp_pose.POSE_CONNECTIONS,
-                landmark_drawing_spec=mp_drawing.DrawingSpec(color=(0, 255, 255), thickness=2, circle_radius=3),
-                connection_drawing_spec=mp_drawing.DrawingSpec(color=(0, 128, 255), thickness=2)
-            )
-
-            # Get important keypoints
-            left_shoulder = lm[mp_pose.PoseLandmark.LEFT_SHOULDER]
-            right_shoulder = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER]
-            left_hip = lm[mp_pose.PoseLandmark.LEFT_HIP]
-            right_hip = lm[mp_pose.PoseLandmark.RIGHT_HIP]
-
-            # Midpoints
-            mid_shoulder = type(left_shoulder)(x=(left_shoulder.x + right_shoulder.x) / 2,
-                                               y=(left_shoulder.y + right_shoulder.y) / 2,
-                                               z=0, visibility=1.0)
-
-            mid_hip = type(left_hip)(x=(left_hip.x + right_hip.x) / 2,
-                                     y=(left_hip.y + right_hip.y) / 2,
-                                     z=0, visibility=1.0)
-
-            vertical_distance = abs(mid_shoulder.y - mid_hip.y)
-            spine_angle = calculate_angle(mid_shoulder, mid_hip)
-
-            # Pose-based fall logic
-            if spine_angle < 40 or spine_angle > 160:
-                fall_detected_by_pose = True
-
-        # YOLOv8 OBB-based fall detection
+        # YOLOv8 processing
         for result in results:
             if result.obb is not None:
                 obbs = result.obb
-
                 for i in range(len(obbs.xyxyxyxy)):
                     confidence = obbs.conf[i].item()
                     class_id = int(obbs.cls[i])
@@ -143,44 +120,86 @@ def detect_fall(frame):
                     aabb = obbs.xyxy[i].cpu().numpy().astype(int)
                     x1, y1, x2, y2 = aabb
 
-                    # Default values
                     label = "Non-fall"
                     color = (0, 255, 0)
 
-                    if class_name == "fall" and confidence >= 0.7:
-                        if fall_detected_by_pose:
-                            label = "Fall"
-                            color = (0, 0, 255)
-                            final_fall = True
-                        else:
-                            label = "False Alarm"
-                            color = (0, 255, 255)
-                        fall_detected_by_yolo = True
+                    if class_name == "fall" and confidence >= 0.5:
+                        yolo_fall_detected = True
+                        label = "Fall (YOLO)"
+                        color = (0, 0, 255)
 
-                    # Draw OBB + bounding box + label
-                    cv2.polylines(frame, [poly_points], isClosed=True, color=color, thickness=2)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(frame, f"{label} ({confidence:.2f})", (x1, y1 - 10),
+                    cv2.polylines(processed_frame, [poly_points], isClosed=True, color=color, thickness=2)
+                    cv2.rectangle(processed_frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(processed_frame, f"{label} ({confidence:.2f})", (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
-        # Case: Pose detects fall but YOLO doesn't
-        if fall_detected_by_pose and not fall_detected_by_yolo:
-            final_fall = True
-            cv2.putText(frame, "⚠️ Fall detected by posture", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        # Step 2: Pose estimation if YOLO detects a fall
+        if yolo_fall_detected:
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            pose_results = pose.process(rgb_frame)
 
-        return final_fall, frame
+            if pose_results.pose_landmarks:
+                lm = pose_results.pose_landmarks.landmark
+
+                # Draw pose landmarks
+                mp_drawing.draw_landmarks(
+                    processed_frame, pose_results.pose_landmarks, mp_pose.POSE_CONNECTIONS,
+                    mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
+                    mp_drawing.DrawingSpec(color=(0, 0, 255), thickness=2)
+                )
+
+                # Step 3: Analyze pose geometry
+                left_shoulder = lm[mp_pose.PoseLandmark.LEFT_SHOULDER]
+                right_shoulder = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER]
+                left_hip = lm[mp_pose.PoseLandmark.LEFT_HIP]
+                right_hip = lm[mp_pose.PoseLandmark.RIGHT_HIP]
+
+                mid_shoulder = type(left_shoulder)(x=(left_shoulder.x + right_shoulder.x) / 2,
+                                                 y=(left_shoulder.y + right_shoulder.y) / 2,
+                                                 z=0, visibility=1.0)
+                mid_hip = type(left_hip)(x=(left_hip.x + right_hip.x) / 2,
+                                        y=(left_hip.y + right_hip.y) / 2,
+                                        z=0, visibility=1.0)
+
+                vertical_distance = abs(mid_shoulder.y - mid_hip.y)
+                spine_angle = calculate_angle(mid_shoulder, mid_hip)
+
+                if vertical_distance < 0.1 and (spine_angle < 45 or spine_angle > 135):
+                    unnatural_posture = True
+                    cv2.putText(processed_frame, "Unnatural posture", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+                # Step 4: Keras model validation
+                keypoints = extract_keypoints_for_keras(frame)
+                if keypoints is not None:
+                    keypoints = keypoints.reshape(1, -1)
+                    keras_pred = keras_model.predict(keypoints, verbose=0)
+                    keras_pred_class = keras_label_encoder.inverse_transform([np.argmax(keras_pred)])[0]
+                    keras_confidence = np.max(keras_pred) * 100
+
+                    cv2.putText(processed_frame, f"Keras: {keras_pred_class} ({keras_confidence:.2f}%)", (10, 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+                    # Step 5: Fusion logic
+                    if keras_pred_class == "fall" and unnatural_posture:
+                        final_fall = True
+                        cv2.putText(processed_frame, "Confirmed Fall", (10, 90),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    elif keras_pred_class in ["non_fall", "bending"]:
+                        cv2.putText(processed_frame, "False Alarm", (10, 90),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+        return final_fall, processed_frame
 
     except Exception as e:
-        print("Error in detect_fall:", e)
+        print(f"Error in detect_fall: {e}")
         return False, frame
-
 
 # Record fall video
 def record_fall_video():
     global recording, frames_to_record
     recording = True
-    frames_to_record = []
+    frames_to_record = frames_buffer[-buffer_size:]  # Include pre-fall frames
     start_time = time.time()
 
     while recording and (time.time() - start_time) < RECORD_DURATION:
@@ -202,14 +221,14 @@ def record_fall_video():
         out.release()
 
         try:
-            return upload_to_drive(video_path)
+            return upload_to_drive(video_path)  # Assumes upload_to_drive is defined
         except Exception as e:
             print(f"Drive upload error: {e}")
             return None
     return None
 
-# Send WhatsApp alert
 def send_whatsapp_notification(timestamp, video_link=None):
+# Send WhatsApp alert
     try:
         message_body = f"🚨 Fall Detected at {timestamp}!"
         if video_link:
@@ -232,14 +251,33 @@ def record_and_send_notification():
     video_link = record_fall_video()
     send_whatsapp_notification(timestamp, video_link)
 
-# Frame generator for Flask route
+# Inference thread
+def inference_thread():
+    global fall_detected_global, last_fall_time
+    while True:
+        frame = frame_queue.get()
+        fall_detected, _ = detect_fall(frame)
+        current_time = time.time()
+
+        if fall_detected and (current_time - last_fall_time > FALL_DEBOUNCE_TIME):
+            fall_detected_global = True
+            last_fall_time = current_time
+            threading.Thread(target=record_and_send_notification, daemon=True).start()
+        else:
+            fall_detected_global = False
+        frame_queue.task_done()
+
+# Frame generator for Flask
 def generate_frames():
     while True:
         success, frame = cap.read()
         if not success:
             break
 
-        # Run detection and draw boxes
+        frames_buffer.append(frame.copy())
+        if len(frames_buffer) > buffer_size:
+            frames_buffer.pop(0)
+
         _, processed_frame = detect_fall(frame.copy())
 
         if frame_queue.qsize() < 1:
@@ -271,9 +309,13 @@ def fall_status():
         })
     return jsonify({"error": "Camera read error"})
 
-# Run app
+# Main execution
 if __name__ == "__main__":
-    import numpy as np  # Required for drawing polygons
     print("Starting Flask app...")
     threading.Thread(target=inference_thread, daemon=True).start()
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    try:
+        app.run(host="0.0.0.0", port=5000, debug=False)
+    finally:
+        cap.release()
+        pose.close()
+        print("Program terminated")
